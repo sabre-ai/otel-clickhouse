@@ -1,17 +1,18 @@
 # SABRE ClickHouse Demo
 
-A standalone demo environment for investigating Kubernetes incidents using [SABRE](https://github.com/sabre-ai/sabre-ai) with ClickHouse/ClickStack observability data.
+A standalone demo environment for investigating Kubernetes incidents using [SABRE](https://github.com/sabre-ai/sabre-ai) with ClickHouse observability data.
 
-Deploys a local kind cluster with the [OpenTelemetry Demo](https://opentelemetry.io/docs/demo/) application, ClickStack for storage, and feature flags for injecting anomalies.
+Deploys a local kind cluster with the [OpenTelemetry Demo](https://opentelemetry.io/docs/demo/) application, standalone ClickHouse for storage, and feature flags for injecting anomalies.
 
 ## Prerequisites
 
 - [kubectl](https://kubernetes.io/docs/tasks/tools/)
 - [helm](https://helm.sh/docs/intro/install/)
 - [kind](https://kind.sigs.k8s.io/docs/user/quick-start/#installation)
-- [clickhouse-client](https://clickhouse.com/docs/en/install) (`brew install clickhouse`)
+- [clickhouse client](https://clickhouse.com/docs/interfaces/cli) (`curl https://clickhouse.com/ | sh` or `brew install clickhouse`)
 - [jq](https://jqlang.github.io/jq/download/) (for anomaly injection)
 - [SABRE](https://github.com/sabre-ai/sabre-ai)
+- Docker with at least 6GB memory allocated
 
 ## Quick Start
 
@@ -19,8 +20,8 @@ Deploys a local kind cluster with the [OpenTelemetry Demo](https://opentelemetry
 # 1. Deploy the demo environment
 ./setup.sh
 
-# 2. Verify data is flowing
-clickhouse-client --query "SELECT count() FROM otel_logs"
+# 2. Verify data is flowing (wait 2-3 minutes after setup)
+clickhouse client --port 9000 --query "SELECT count() FROM otel_logs"
 
 # 3. Inject an anomaly
 ./inject_anomaly.sh recommendationCacheFailure
@@ -59,21 +60,22 @@ The ClickHouse CLI integration teaches SABRE the OTel schema, SQL patterns, and 
 
 ```
 kind cluster (sabre-ch-demo)
-├── ClickStack (Helm)
-│   ├── ClickHouse (stores OTel data)
-│   └── HyperDX (optional UI)
+├── ClickHouse (standalone, lightweight)
+│   └── OTel tables: otel_logs, otel_traces, otel_metrics_*
+├── OTel-to-ClickHouse Bridge (otel-collector-contrib)
+│   └── Receives OTLP, writes to ClickHouse
 ├── OpenTelemetry Demo (Helm)
 │   ├── Frontend, Cart, Checkout, Payment, ...
-│   ├── OTel Collector → ClickHouse exporter
+│   ├── OTel Collector → Bridge → ClickHouse
 │   └── flagd (feature flags for anomaly injection)
-└── cert-manager
+└── kube-system (CoreDNS, etc.)
 ```
 
 ## Scripts
 
 | Script | Description |
 |--------|-------------|
-| `setup.sh` | Create kind cluster, install ClickStack + OTel demo |
+| `setup.sh` | Create kind cluster, deploy ClickHouse + bridge + OTel demo |
 | `inject_anomaly.sh <name>` | Enable a feature flag to inject an anomaly |
 | `clear_anomaly.sh` | Disable all anomaly feature flags |
 | `teardown.sh` | Delete the kind cluster |
@@ -81,14 +83,19 @@ kind cluster (sabre-ch-demo)
 ## Troubleshooting
 
 **No data in ClickHouse?**
-- Check OTel Collector logs: `kubectl logs -n otel-demo -l app=otel-collector`
-- Verify ClickHouse is accessible: `kubectl port-forward svc/clickstack-clickhouse 9000:9000 &`
-- Check collector config exports to ClickHouse endpoint
+- Check bridge collector logs: `kubectl logs deploy/otel-clickhouse-bridge`
+- Check OTel demo collector logs: `kubectl logs -n otel-demo -l app.kubernetes.io/component=agent-collector`
+- Verify ClickHouse is accessible: `kubectl port-forward svc/clickhouse 9000:9000 &`
+- Verify tables exist: `clickhouse client --port 9000 --query "SHOW TABLES"`
 
 **Anomaly not taking effect?**
 - Ensure flagd restarted: `kubectl get pods -n otel-demo | grep flagd`
 - Wait at least 5 minutes for telemetry to accumulate
 - Verify flag state: `kubectl get configmap flagd-config -n otel-demo -o jsonpath='{.data.flags\.json}' | jq .`
+
+**Resource pressure / pods crashing?**
+- Ensure Docker has at least 6GB memory: Docker Desktop > Settings > Resources
+- Scale down non-essential demo services: `kubectl scale deploy -n otel-demo ad fraud-detection image-provider product-reviews accounting email --replicas=0`
 
 ## License
 
