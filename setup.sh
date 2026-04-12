@@ -47,120 +47,9 @@ echo "[2/5] Deploying ClickHouse..."
 if kubectl get deploy clickhouse &>/dev/null; then
   echo "  ClickHouse already deployed, skipping."
 else
+  # OTel tables are created automatically by the bridge collector (create_schema: true)
+  # Do NOT use init SQL — the exporter's schema includes columns that manual DDL misses
   kubectl apply -f - <<'CHEOF'
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: clickhouse-init
-data:
-  01_logs.sql: |
-    CREATE TABLE IF NOT EXISTS otel_logs (
-        Timestamp DateTime64(9),
-        TraceId String,
-        SpanId String,
-        TraceFlags UInt32,
-        SeverityText LowCardinality(String),
-        SeverityNumber Int32,
-        ServiceName LowCardinality(String),
-        Body String,
-        ResourceSchemaUrl String,
-        ResourceAttributes Map(LowCardinality(String), String),
-        ScopeSchemaUrl String,
-        ScopeName String,
-        ScopeVersion String,
-        ScopeAttributes Map(LowCardinality(String), String),
-        LogAttributes Map(LowCardinality(String), String)
-    ) ENGINE = MergeTree()
-    ORDER BY (ServiceName, Timestamp)
-    TTL toDateTime(Timestamp) + INTERVAL 3 DAY;
-  02_traces.sql: |
-    CREATE TABLE IF NOT EXISTS otel_traces (
-        Timestamp DateTime64(9),
-        TraceId String,
-        SpanId String,
-        ParentSpanId String,
-        TraceState String,
-        SpanName LowCardinality(String),
-        SpanKind LowCardinality(String),
-        ServiceName LowCardinality(String),
-        ResourceAttributes Map(LowCardinality(String), String),
-        ScopeName String,
-        ScopeVersion String,
-        SpanAttributes Map(LowCardinality(String), String),
-        Duration Int64,
-        StatusCode LowCardinality(String),
-        StatusMessage String
-    ) ENGINE = MergeTree()
-    ORDER BY (ServiceName, Timestamp)
-    TTL toDateTime(Timestamp) + INTERVAL 3 DAY;
-  03_traces_ts.sql: |
-    CREATE TABLE IF NOT EXISTS otel_traces_trace_id_ts AS otel_traces;
-  04_metrics_gauge.sql: |
-    CREATE TABLE IF NOT EXISTS otel_metrics_gauge (
-        ResourceAttributes Map(LowCardinality(String), String),
-        ResourceSchemaUrl String,
-        ScopeName String,
-        ScopeVersion String,
-        ScopeAttributes Map(LowCardinality(String), String),
-        ScopeSchemaUrl String,
-        MetricName LowCardinality(String),
-        MetricDescription String,
-        MetricUnit String,
-        Attributes Map(LowCardinality(String), String),
-        StartTimeUnix DateTime64(9),
-        TimeUnix DateTime64(9),
-        Value Float64,
-        Flags UInt32
-    ) ENGINE = MergeTree()
-    ORDER BY (MetricName, TimeUnix)
-    TTL toDateTime(TimeUnix) + INTERVAL 3 DAY;
-  05_metrics_sum.sql: |
-    CREATE TABLE IF NOT EXISTS otel_metrics_sum (
-        ResourceAttributes Map(LowCardinality(String), String),
-        ResourceSchemaUrl String,
-        ScopeName String,
-        ScopeVersion String,
-        ScopeAttributes Map(LowCardinality(String), String),
-        ScopeSchemaUrl String,
-        MetricName LowCardinality(String),
-        MetricDescription String,
-        MetricUnit String,
-        Attributes Map(LowCardinality(String), String),
-        StartTimeUnix DateTime64(9),
-        TimeUnix DateTime64(9),
-        Value Float64,
-        Flags UInt32,
-        AggTemp Int32,
-        IsMonotonic Bool
-    ) ENGINE = MergeTree()
-    ORDER BY (MetricName, TimeUnix)
-    TTL toDateTime(TimeUnix) + INTERVAL 3 DAY;
-  06_metrics_histogram.sql: |
-    CREATE TABLE IF NOT EXISTS otel_metrics_histogram (
-        ResourceAttributes Map(LowCardinality(String), String),
-        ResourceSchemaUrl String,
-        ScopeName String,
-        ScopeVersion String,
-        ScopeAttributes Map(LowCardinality(String), String),
-        ScopeSchemaUrl String,
-        MetricName LowCardinality(String),
-        MetricDescription String,
-        MetricUnit String,
-        Attributes Map(LowCardinality(String), String),
-        StartTimeUnix DateTime64(9),
-        TimeUnix DateTime64(9),
-        Count UInt64,
-        Sum Float64,
-        BucketCounts Array(UInt64),
-        ExplicitBounds Array(Float64),
-        Min Float64,
-        Max Float64,
-        Flags UInt32,
-        AggTemp Int32
-    ) ENGINE = MergeTree()
-    ORDER BY (MetricName, TimeUnix)
-    TTL toDateTime(TimeUnix) + INTERVAL 3 DAY;
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -201,14 +90,9 @@ spec:
         volumeMounts:
         - name: data
           mountPath: /var/lib/clickhouse
-        - name: init-sql
-          mountPath: /docker-entrypoint-initdb.d
       volumes:
       - name: data
         emptyDir: {}
-      - name: init-sql
-        configMap:
-          name: clickhouse-init
 ---
 apiVersion: v1
 kind: Service
@@ -266,7 +150,7 @@ data:
           initial_interval: 5s
           max_interval: 30s
           max_elapsed_time: 300s
-        create_schema: false
+        create_schema: true
       debug:
         verbosity: basic
     service:
