@@ -6,7 +6,7 @@ set -euo pipefail
 # so data always looks fresh — no waiting for real telemetry.
 
 ANOMALY="${1:-recommendationCacheFailure}"
-CH="clickhouse client --port 9000"
+CH="clickhouse client --port 19000"
 
 AVAILABLE_ANOMALIES=(
   "recommendationCacheFailure"
@@ -32,9 +32,9 @@ done
 [[ "$VALID" != "true" ]] && echo "ERROR: Unknown anomaly '${ANOMALY}'" && usage
 
 if ! $CH --query "SELECT 1" &>/dev/null; then
-  echo "ERROR: Cannot connect to ClickHouse on port 9000."
+  echo "ERROR: Cannot connect to ClickHouse on port 19000."
   echo "  Is the demo deployed? Run ./setup.sh first."
-  echo "  Or port-forward: kubectl port-forward svc/clickhouse 9000:9000 &"
+  echo "  Or port-forward: kubectl port-forward svc/clickhouse 19000:9000 &"
   exit 1
 fi
 

@@ -1,24 +1,69 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Usage: ./setup.sh [data_limit]
+#   data_limit: max ClickHouse storage size (default: 1Gi). Examples: 512Mi, 2Gi, 5Gi
+
 CLUSTER_NAME="sabre-ch-demo"
 NAMESPACE="otel-demo"
+HOST_CH_PORT=19000
+DATA_LIMIT="${1:-1Gi}"
 
 echo "=== SABRE ClickHouse Demo Setup ==="
+echo "  ClickHouse data limit: ${DATA_LIMIT}"
 echo ""
 
 # --- Pre-flight checks ---
-for cmd in kubectl helm kind; do
-  if ! command -v "$cmd" &>/dev/null; then
-    echo "ERROR: '$cmd' is required but not installed."
-    exit 1
+echo "Checking prerequisites..."
+PREFLIGHT_OK=true
+
+for cmd in docker kubectl helm kind clickhouse jq; do
+  if command -v "$cmd" &>/dev/null; then
+    echo "  ✓ $cmd ($(command -v "$cmd"))"
+  else
+    case "$cmd" in
+      clickhouse) hint="curl https://clickhouse.com/ | sh  OR  brew install clickhouse" ;;
+      jq)         hint="brew install jq  OR  https://jqlang.github.io/jq/download/" ;;
+      kind)       hint="https://kind.sigs.k8s.io/docs/user/quick-start/#installation" ;;
+      helm)       hint="https://helm.sh/docs/intro/install/" ;;
+      kubectl)    hint="https://kubernetes.io/docs/tasks/tools/" ;;
+      docker)     hint="https://docs.docker.com/get-docker/" ;;
+      *)          hint="" ;;
+    esac
+    echo "  ✗ $cmd — not found. Install: $hint"
+    PREFLIGHT_OK=false
   fi
 done
 
-# Check port 9000 is available (ClickHouse native protocol)
-if lsof -i :9000 -P -n 2>/dev/null | grep -q LISTEN; then
-  echo "ERROR: Port 9000 is already in use."
-  echo "  Check what's using it: lsof -i :9000"
+# Check Docker daemon is actually running (not just installed)
+if command -v docker &>/dev/null; then
+  if ! docker info &>/dev/null; then
+    echo "  ✗ Docker daemon is not running. Please start Docker Desktop or the Docker service."
+    PREFLIGHT_OK=false
+  else
+    echo "  ✓ Docker daemon is running"
+  fi
+fi
+
+if [ "$PREFLIGHT_OK" = false ]; then
+  echo ""
+  echo "ERROR: Missing prerequisites. Please fix the issues above and re-run."
+  exit 1
+fi
+
+echo ""
+
+# Check host port is available (ClickHouse native protocol, mapped to 19000 to avoid macOS AirPlay on 9000)
+# Use both lsof and netstat — lsof without root misses system services
+PORT_IN_USE=false
+if lsof -i :${HOST_CH_PORT} -P -n 2>/dev/null | grep -q LISTEN; then
+  PORT_IN_USE=true
+elif netstat -an 2>/dev/null | grep -qE "\.${HOST_CH_PORT}\s.*LISTEN"; then
+  PORT_IN_USE=true
+fi
+if [ "$PORT_IN_USE" = true ]; then
+  echo "ERROR: Port ${HOST_CH_PORT} is already in use."
+  echo "  Check what's using it: lsof -i :${HOST_CH_PORT}"
   echo "  If a previous demo is running: ./teardown.sh"
   exit 1
 fi
@@ -35,7 +80,7 @@ nodes:
   - role: control-plane
     extraPortMappings:
       - containerPort: 30900
-        hostPort: 9000
+        hostPort: 19000
         protocol: TCP
 EOF
 fi
@@ -49,7 +94,7 @@ if kubectl get deploy clickhouse &>/dev/null; then
 else
   # OTel tables are created automatically by the bridge collector (create_schema: true)
   # Do NOT use init SQL — the exporter's schema includes columns that manual DDL misses
-  kubectl apply -f - <<'CHEOF'
+  kubectl apply -f - <<CHEOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -92,7 +137,8 @@ spec:
           mountPath: /var/lib/clickhouse
       volumes:
       - name: data
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: ${DATA_LIMIT}
 ---
 apiVersion: v1
 kind: Service
@@ -262,13 +308,13 @@ kubectl wait --for=condition=Ready pod --all -n "${NAMESPACE}" --timeout=600s 2>
 echo ""
 echo "=== Setup Complete ==="
 echo ""
-echo "ClickHouse native port: localhost:9000 (via kind NodePort)"
+echo "ClickHouse native port: localhost:${HOST_CH_PORT} (via kind NodePort)"
 echo ""
 echo "To verify data ingestion (wait 2-3 minutes for data to flow):"
-echo "  clickhouse client --port 9000 --query 'SELECT count() FROM otel_logs'"
+echo "  clickhouse client --port ${HOST_CH_PORT} --query 'SELECT count() FROM otel_logs'"
 echo ""
 echo "To port-forward ClickHouse (if NodePort not working):"
-echo "  kubectl port-forward svc/clickhouse 9000:9000 &"
+echo "  kubectl port-forward svc/clickhouse ${HOST_CH_PORT}:9000 &"
 echo ""
 echo "To use with SABRE:"
 echo "  uv run sabre"
