@@ -2,13 +2,14 @@
 set -euo pipefail
 
 CLUSTER_NAME="sabre-ch-demo"
-NAMESPACE="otel-demo"
+ECOMMERCE_REPO="https://github.com/sabre-ai/ecommerce.git"
+ECOMMERCE_DIR="/tmp/sabre-ecommerce"
 
 echo "=== SABRE ClickHouse Demo Setup ==="
 echo ""
 
 # --- Pre-flight checks ---
-for cmd in kubectl helm kind; do
+for cmd in kubectl kind docker git; do
   if ! command -v "$cmd" &>/dev/null; then
     echo "ERROR: '$cmd' is required but not installed."
     exit 1
@@ -42,13 +43,18 @@ fi
 
 kubectl config use-context "kind-${CLUSTER_NAME}"
 
+# --- Pre-pull heavy images into kind node ---
+echo "Pre-pulling container images into kind node..."
+docker pull clickhouse/clickhouse-server:25.3-alpine
+docker pull otel/opentelemetry-collector-contrib:0.114.0
+kind load docker-image clickhouse/clickhouse-server:25.3-alpine otel/opentelemetry-collector-contrib:0.114.0 --name "${CLUSTER_NAME}"
+
 # --- Step 2: Deploy standalone ClickHouse ---
 echo "[2/5] Deploying ClickHouse..."
 if kubectl get deploy clickhouse &>/dev/null; then
   echo "  ClickHouse already deployed, skipping."
 else
   # OTel tables are created automatically by the bridge collector (create_schema: true)
-  # Do NOT use init SQL — the exporter's schema includes columns that manual DDL misses
   kubectl apply -f - <<'CHEOF'
 apiVersion: apps/v1
 kind: Deployment
@@ -113,7 +119,9 @@ spec:
 CHEOF
 
   echo "  Waiting for ClickHouse to be ready..."
-  sleep 5  # Wait for pod to be created before waiting on condition
+  until kubectl get pod -l app=clickhouse -o name 2>/dev/null | grep -q .; do
+    sleep 2
+  done
   kubectl wait --for=condition=Ready pod -l app=clickhouse --timeout=120s
 fi
 
@@ -221,57 +229,73 @@ spec:
 BREOF
 
   echo "  Waiting for bridge collector to be ready..."
-  sleep 5  # Wait for pod to be created before waiting on condition
+  until kubectl get pod -l app=otel-clickhouse-bridge -o name 2>/dev/null | grep -q .; do
+    sleep 2
+  done
   kubectl wait --for=condition=Ready pod -l app=otel-clickhouse-bridge --timeout=120s
 fi
 
-# --- Step 4: Deploy OpenTelemetry demo application ---
-echo "[4/5] Deploying OpenTelemetry demo application..."
-kubectl create namespace "${NAMESPACE}" 2>/dev/null || true
+# --- Step 4: Deploy ecommerce application ---
+echo "[4/5] Deploying ecommerce application..."
 
-helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts 2>/dev/null || true
-helm repo update open-telemetry
-
-BRIDGE_ENDPOINT="otel-clickhouse-bridge.default.svc.cluster.local"
-
-if helm list -n "${NAMESPACE}" -q | grep -q "^otel-demo$"; then
-  echo "  OTel demo already installed, skipping."
+# Clone or update the ecommerce repo
+if [[ -d "${ECOMMERCE_DIR}/.git" ]]; then
+  echo "  Updating ecommerce repo..."
+  git -C "${ECOMMERCE_DIR}" pull --ff-only
 else
-  # Install with heavy backends disabled; export telemetry to ClickHouse bridge
-  helm install otel-demo open-telemetry/opentelemetry-demo \
-    -n "${NAMESPACE}" \
-    --set grafana.enabled=false \
-    --set jaeger.enabled=false \
-    --set prometheus.enabled=false \
-    --set opensearch.enabled=false \
-    --set components.llm.enabled=false \
-    --set "opentelemetry-collector.config.exporters.otlp/clickhouse.endpoint=${BRIDGE_ENDPOINT}:4317" \
-    --set "opentelemetry-collector.config.exporters.otlp/clickhouse.tls.insecure=true" \
-    --set 'opentelemetry-collector.config.service.pipelines.logs.exporters={debug,otlp/clickhouse}' \
-    --set 'opentelemetry-collector.config.service.pipelines.traces.exporters={debug,otlp/clickhouse,spanmetrics}' \
-    --set 'opentelemetry-collector.config.service.pipelines.metrics.exporters={debug,otlp/clickhouse}' \
-    --timeout 600s
+  echo "  Cloning ecommerce repo..."
+  rm -rf "${ECOMMERCE_DIR}"
+  git clone "${ECOMMERCE_REPO}" "${ECOMMERCE_DIR}"
 fi
 
-# --- Step 5: Wait for everything ---
-echo "[5/5] Waiting for all pods to be ready..."
+# Build and load the backend Docker image
+echo "  Building ecommerce-api Docker image..."
+docker build -t ecommerce-api:latest "${ECOMMERCE_DIR}/backend"
+kind load docker-image ecommerce-api:latest --name "${CLUSTER_NAME}"
+
+# Create namespace and deploy
+kubectl create namespace ecommerce 2>/dev/null || true
+
+kubectl create configmap nginx-config -n ecommerce \
+  --from-file=default.conf="${ECOMMERCE_DIR}/nginx.conf" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl apply -f "${ECOMMERCE_DIR}/deployment.yaml"
+
+echo "  Waiting for ecommerce pods to be ready..."
+kubectl wait --for=condition=Ready pod -l app=ecommerce-api -n ecommerce --timeout=120s
+kubectl wait --for=condition=Ready pod -l app=load-generator -n ecommerce --timeout=120s 2>/dev/null || true
+
+# --- Step 5: Verify data flow ---
+echo "[5/5] Waiting for telemetry data to flow..."
 kubectl wait --for=condition=Ready pod -l app=clickhouse --timeout=120s 2>/dev/null || true
 kubectl wait --for=condition=Ready pod -l app=otel-clickhouse-bridge --timeout=120s 2>/dev/null || true
-kubectl wait --for=condition=Ready pod --all -n "${NAMESPACE}" --timeout=600s 2>/dev/null || true
+
+# Wait for some data to appear in ClickHouse
+echo "  Waiting for ecommerce telemetry in ClickHouse (up to 2 minutes)..."
+for i in $(seq 1 24); do
+  COUNT=$(clickhouse client --port 9000 --query "SELECT count() FROM otel_logs WHERE ServiceName = 'ecommerce-api'" 2>/dev/null || echo 0)
+  if [[ "$COUNT" -gt 0 ]]; then
+    echo "  Found ${COUNT} log rows from ecommerce-api."
+    break
+  fi
+  sleep 5
+done
 
 echo ""
 echo "=== Setup Complete ==="
 echo ""
 echo "ClickHouse native port: localhost:9000 (via kind NodePort)"
 echo ""
-echo "To verify data ingestion (wait 2-3 minutes for data to flow):"
-echo "  clickhouse client --port 9000 --query 'SELECT count() FROM otel_logs'"
+echo "Running pods:"
+kubectl get pods -n ecommerce --no-headers 2>/dev/null | sed 's/^/  /'
 echo ""
-echo "To port-forward ClickHouse (if NodePort not working):"
-echo "  kubectl port-forward svc/clickhouse 9000:9000 &"
+echo "To verify data:"
+echo "  clickhouse client --query \"SELECT SeverityText, count() FROM otel_logs WHERE ServiceName='ecommerce-api' GROUP BY SeverityText\""
 echo ""
 echo "To use with SABRE:"
-echo "  uv run sabre"
-echo "  > use clickhouse integration"
-echo "  > Investigate: <describe the issue>"
+echo "  sabre"
+echo "  > The ecommerce-api service is showing checkout failures. Use the otel tables"
+echo "  >   in clickhouse to investigate errors with stack traces. The source code is"
+echo "  >   at github.com/sabre-ai/ecommerce"
 echo ""
