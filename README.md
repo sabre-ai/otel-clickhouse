@@ -97,8 +97,8 @@ kind cluster (sabre-ch-demo)
 **No data in ClickHouse?**
 - Check bridge collector logs: `kubectl logs deploy/otel-clickhouse-bridge`
 - Check OTel demo collector logs: `kubectl logs -n otel-demo -l app.kubernetes.io/component=agent-collector`
-- Verify ClickHouse is accessible: `kubectl port-forward svc/clickhouse 9000:9000 &`
-- Verify tables exist: `clickhouse client --port 9000 --query "SHOW TABLES"`
+- Verify ClickHouse is accessible: `kubectl port-forward svc/clickhouse 19000:9000 &`
+- Verify tables exist: `clickhouse client --port 19000 --query "SHOW TABLES"`
 
 **Anomaly not taking effect?**
 - Ensure flagd restarted: `kubectl get pods -n otel-demo | grep flagd`

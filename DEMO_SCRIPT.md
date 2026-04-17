@@ -26,7 +26,7 @@ Creates a kind cluster with:
 Wait 10-15 minutes. Verify:
 
 ```bash
-clickhouse client --port 9000 --query "SELECT 'logs', count() FROM otel_logs UNION ALL SELECT 'traces', count() FROM otel_traces"
+clickhouse client --port 19000 --query "SELECT 'logs', count() FROM otel_logs UNION ALL SELECT 'traces', count() FROM otel_traces"
 ```
 
 Both counts should be in the thousands.
@@ -53,7 +53,7 @@ Confirm it loads, then exit.
 ### Step 5: Verify there's interesting data
 
 ```bash
-clickhouse client --port 9000 --query "
+clickhouse client --port 19000 --query "
 SELECT ServiceName, round(quantile(0.95)(Duration/1e6)) AS p95_ms
 FROM otel_traces WHERE Timestamp BETWEEN '2026-04-12 19:15:00' AND '2026-04-12 19:40:00'
 GROUP BY ServiceName ORDER BY p95_ms DESC LIMIT 5"
@@ -66,7 +66,7 @@ You should see accounting at ~40,000ms p95.
 ```bash
 # Re-establish port-forward if queries hang
 pkill -f "kubectl port-forward svc/clickhouse"; sleep 1
-kubectl port-forward svc/clickhouse 9000:9000 &
+kubectl port-forward svc/clickhouse 19000:9000 &
 
 # Nuclear option
 ./teardown.sh && ./setup.sh
